@@ -38,7 +38,7 @@ try:
 except:
   gitname = ""
 try:
-  ip = requests.get('https://checkip.amazonaws.com/').text.strip()
+  ip = requests.get('').text.strip()
 except Exception:
   ip = "255.255.255.255"
 error_tags = {'dirty': get_dirty(), 'dongle_id': dongle_id, 'branch': get_branch(), 'remote': get_origin(), 'fingerprintedAs': candidate, 'gitname':gitname}
@@ -70,7 +70,7 @@ def bind_extra(**kwargs) -> None:
     sentry_sdk.set_tag(k, v)
 
 def init() -> None:
-  sentry_sdk.init("https://137e8e621f114f858f4c392c52e18c6d:8aba82f49af040c8aac45e95a8484970@sentry.io/1404547",
+  sentry_sdk.init("",
                   default_integrations=False, integrations=[ThreadingIntegration(propagate_hub=True)],
                   release=get_version())
 

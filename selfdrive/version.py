@@ -72,7 +72,7 @@ def get_comma_remote() -> bool:
   if origin is None:
     return False
 
-  return origin.startswith('git@github.com:arne182') or origin.startswith('https://github.com/arne182')
+  return origin.startswith('git@github.com:space-b') or origin.startswith('https://github.com/space-b')
 
 
 @cache
