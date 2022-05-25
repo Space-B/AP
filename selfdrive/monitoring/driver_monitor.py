@@ -9,12 +9,6 @@ from common.stat_live import RunningStatFilter
 
 EventName = car.CarEvent.EventName
 
-# ******************************************************************************************
-#  NOTE: To fork maintainers.
-#  Disabling or nerfing safety features will get you and your users banned from our servers.
-#  We recommend that you do not change these numbers from the defaults.
-# ******************************************************************************************
-
 class DRIVER_MONITOR_SETTINGS():
   def __init__(self, TICI=TICI, DT_DMON=DT_DMON):
     self._DT_DMON = DT_DMON

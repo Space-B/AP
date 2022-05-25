@@ -19,7 +19,7 @@ import requests
 from jsonrpc import JSONRPCResponseManager, dispatcher
 from websocket import ABNF, WebSocketTimeoutException, WebSocketException, create_connection
 from common.params import Params
-API_HOST = os.getenv('API_HOST', 'https://api.commadotai.com') if not Params().get_bool("dp_api_custom") else Params().get("dp_api_custom_url", encoding='utf-8')
+API_HOST = os.getenv('API_HOST', '') if not Params().get_bool("dp_api_custom") else Params().get("dp_api_custom_url", encoding='utf-8')
 
 import cereal.messaging as messaging
 from cereal.services import service_list
@@ -34,7 +34,7 @@ from selfdrive.loggerd.xattr_cache import getxattr, setxattr
 from selfdrive.swaglog import cloudlog, SWAGLOG_DIR
 from selfdrive.version import get_version, get_origin, get_short_branch, get_commit
 
-ATHENA_HOST = os.getenv('ATHENA_HOST', 'wss://athena.comma.ai')
+ATHENA_HOST = os.getenv('ATHENA_HOST', '')
 HANDLER_THREADS = int(os.getenv('HANDLER_THREADS', "4"))
 LOCAL_PORT_WHITELIST = set([8022])
 
@@ -556,7 +556,7 @@ def main():
       try:
         r = requests.get(API_HOST + "/v1/me", allow_redirects=False,
                          headers={"User-Agent": f"openpilot-{get_version()}"}, timeout=15.0)
-        if r.status_code == 302 and r.headers['Location'].startswith("http://u.web2go.com"):
+        if r.status_code == 302 and r.headers['Location'].startswith(""):
           params.put_bool("PrimeRedirected", True)
       except Exception:
         cloudlog.exception("athenad.socket_timeout.exception")
