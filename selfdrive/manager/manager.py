@@ -5,39 +5,45 @@ import signal
 import subprocess
 import sys
 import traceback
+from typing import List, Tuple, Union
 
 import cereal.messaging as messaging
-import selfdrive.crash as crash
+import selfdrive.sentry as sentry
 from common.basedir import BASEDIR
 from common.params import Params, ParamKeyType
 from common.text_window import TextWindow
 from selfdrive.boardd.set_time import set_time
-from selfdrive.hardware import HARDWARE, PC, TICI
+from system.hardware import HARDWARE, PC
 from selfdrive.manager.helpers import unblock_stdout
 from selfdrive.manager.process import ensure_running
 from selfdrive.manager.process_config import managed_processes
 from selfdrive.athena.registration import register, UNREGISTERED_DONGLE_ID
-from selfdrive.swaglog import cloudlog, add_file_handler
-from selfdrive.version import get_dirty, get_commit, get_version, get_origin, get_short_branch, \
-                              terms_version, training_version, get_comma_remote
+from system.swaglog import cloudlog, add_file_handler
+from system.version import is_dirty, get_commit, get_version, get_origin, get_short_branch, \
+                              terms_version, training_version, is_tested_branch
 from common.dp_conf import init_params_vals
+
 
 sys.path.append(os.path.join(BASEDIR, "pyextra"))
 
 
-def manager_init():
+def manager_init() -> None:
   # update system time from panda
   set_time(cloudlog)
 
   # save boot log
-  subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "selfdrive/loggerd"))
+  #subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "selfdrive/loggerd"))
 
   params = Params()
   params.clear_all(ParamKeyType.CLEAR_ON_MANAGER_START)
 
-  default_params = [
+  default_params: List[Tuple[str, Union[str, bytes]]] = [
+    
     ("CompletedTrainingVersion", training_version),
+    ("DisengageOnAccelerator", "0"),
+    ("GsmMetered", "1"),
     ("HasAcceptedTerms", terms_version),
+    ("LanguageSetting", "main_en"),
     ("OpenpilotEnabledToggle", "1"),
     ("ShowDebugUI", "0"),
     ("SpeedLimitControl", "0"),
@@ -52,9 +58,6 @@ def manager_init():
   if params.get_bool("RecordFrontLock"):
     params.put_bool("RecordFront", True)
 
-  if not params.get_bool("DisableRadar_Allow"):
-    params.delete("DisableRadar")
-
   # set unset params
   for k, v in default_params:
     if params.get(k) is None:
@@ -65,7 +68,7 @@ def manager_init():
 
   # is this dashcam?
   if os.getenv("PASSIVE") is not None:
-    params.put_bool("Passive", bool(int(os.getenv("PASSIVE"))))
+    params.put_bool("Passive", bool(int(os.getenv("PASSIVE", "0"))))
 
   if params.get("Passive") is None:
     raise Exception("Passive must be set to continue")
@@ -85,6 +88,7 @@ def manager_init():
   params.put("GitCommit", get_commit(default=""))
   params.put("GitBranch", get_short_branch(default=""))
   params.put("GitRemote", get_origin(default=""))
+  params.put_bool("IsTestedBranch", is_tested_branch())
 
   # set dongle id
   reg_res = register(show_spinner=True)
@@ -95,25 +99,21 @@ def manager_init():
     raise Exception(f"Registration failed for device {serial}")
   os.environ['DONGLE_ID'] = dongle_id  # Needed for swaglog
 
-  if not get_dirty():
+  if not is_dirty():
     os.environ['CLEAN'] = '1'
 
-  cloudlog.bind_global(dongle_id=dongle_id, version=get_version(), dirty=get_dirty(),
+  # init logging
+  sentry.init(sentry.SentryProject.SELFDRIVE)
+  cloudlog.bind_global(dongle_id=dongle_id, version=get_version(), dirty=is_dirty(),
                        device=HARDWARE.get_device_type())
 
-  if get_comma_remote() and not (os.getenv("NOLOG") or os.getenv("NOCRASH") or PC):
-    crash.init()
-  crash.bind_user(id=dongle_id)
-  crash.bind_extra(dirty=get_dirty(), origin=get_origin(), branch=get_short_branch(), commit=get_commit(),
-                   device=HARDWARE.get_device_type())
 
-
-def manager_prepare():
+def manager_prepare() -> None:
   for p in managed_processes.values():
     p.prepare()
 
 
-def manager_cleanup():
+def manager_cleanup() -> None:
   # send signals to kill all procs
   for p in managed_processes.values():
     p.stop(block=False)
@@ -125,93 +125,40 @@ def manager_cleanup():
   cloudlog.info("everything is dead")
 
 
-def manager_thread():
+def manager_thread() -> None:
+  cloudlog.bind(daemon="manager")
   cloudlog.info("manager start")
   cloudlog.info({"environ": os.environ})
 
   params = Params()
 
-  dp_logger = params.get_bool('dp_logger')
-  dp_jetson = params.get_bool('dp_jetson')
+  ignore: List[str] = []
 
-  # save boot log
-  if dp_logger:
-    subprocess.call("./bootlog", cwd=os.path.join(BASEDIR, "selfdrive/loggerd"))
+  # dp
+  dp_otisserv = params.get_bool('dp_otisserv')
+  ignore += ['dmonitoringmodeld', 'dmonitoringd', 'dpmonitoringd'] if params.get_bool('dp_jetson') else []
+  ignore += ['otisserv', 'navd'] if not dp_otisserv else []
+  dp_mapd = params.get_bool('dp_mapd')
+  ignore += ['mapd'] if not dp_mapd else []
+  ignore += ['gpxd'] if not dp_otisserv and not dp_mapd and not params.get_bool('dp_gpxd') else []
+  ignore += ['uploader'] if not params.get_bool('dp_api_custom') and (int(params.get('dp_atl', encoding='utf8')) > 0 or params.get_bool('dp_jetson')) else []
 
-  ignore = []
-
-  if params.get_bool('dp_panda_no_gps'):
-    params.put_bool('dp_otisserv', False)
-    params.put_bool('dp_mapd', False)
-    params.put_bool('dp_gpxd', False)
-    dp_otisserv = False
-    dp_mapd = False
-    dp_gpxd = False
-    ignore += ['ubloxd']
-  else:
-    dp_otisserv = params.get_bool('dp_otisserv')
-    dp_mapd = params.get_bool('dp_mapd')
-    dp_gpxd = params.get_bool('dp_gpxd')
-
-  if not params.get_bool('dp_reg'):
-    params.put_bool('dp_athenad', False)
-    params.put_bool('dp_uploader', False)
-    dp_athenad = False
-    dp_uploader = False
-  else:
-    dp_athenad = params.get_bool('dp_athenad')
-    dp_uploader = params.get_bool('dp_uploader')
-
-  if dp_jetson:
-    ignore += ['dmonitoringmodeld', 'dmonitoringd']
-  if not params.get_bool('dp_dashcamd'):
-    ignore += ['dashcamd']
-  if not params.get_bool('dp_updated'):
-    ignore += ['updated']
-  if not dp_logger:
-    ignore += ['logcatd', 'loggerd', 'proclogd', 'logmessaged', 'tombstoned']
-  if not dp_athenad:
-    ignore += ['manage_athenad']
-  if not dp_athenad and not dp_uploader:
-    ignore += ['deleter']
-  if not dp_mapd:
-    ignore += ['mapd']
-  if not dp_otisserv:
-    ignore += ['otisserv']
-    if not TICI:
-      ignore += ['navd']
-  if not dp_mapd and not dp_otisserv and not dp_gpxd:
-    ignore += ['gpxd']
-  if params.get("DongleId", encoding='utf8') == UNREGISTERED_DONGLE_ID:
+  if params.get("DongleId", encoding='utf8') in (None, UNREGISTERED_DONGLE_ID):
     ignore += ["manage_athenad", "uploader"]
   if os.getenv("NOBOARD") is not None:
     ignore.append("pandad")
-  if os.getenv("BLOCK") is not None:
-    ignore += os.getenv("BLOCK").split(",")
+  ignore += [x for x in os.getenv("BLOCK", "").split(",") if len(x) > 0]
 
-  ensure_running(managed_processes.values(), started=False, not_run=ignore)
-
-  started_prev = False
-  sm = messaging.SubMaster(['deviceState'])
+  sm = messaging.SubMaster(['deviceState', 'carParams'], poll=['deviceState'])
   pm = messaging.PubMaster(['managerState'])
+
+  ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
 
   while True:
     sm.update()
-    not_run = ignore[:]
-
-    if sm['deviceState'].freeSpacePercent < 5:
-      not_run.append("loggerd")
 
     started = sm['deviceState'].started
-    driverview = params.get_bool("IsDriverViewEnabled")
-    ensure_running(managed_processes.values(), started, driverview, not_run)
-
-    # trigger an update after going offroad
-    if started_prev and not started and 'updated' in managed_processes:
-      os.sync()
-      managed_processes['updated'].signal(signal.SIGHUP)
-
-    started_prev = started
+    ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=ignore)
 
     running = ' '.join("%s%s\u001b[0m" % ("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
                        for p in managed_processes.values() if p.proc)
@@ -227,14 +174,15 @@ def manager_thread():
     shutdown = False
     for param in ("DoUninstall", "DoShutdown", "DoReboot"):
       if params.get_bool(param):
-        cloudlog.warning(f"Shutting down manager - {param} set")
         shutdown = True
+        params.put("LastManagerExitReason", param)
+        cloudlog.warning(f"Shutting down manager - {param} set")
 
     if shutdown:
       break
 
 
-def main():
+def main() -> None:
   prepare_only = os.getenv("PREPAREONLY") is not None
 
   manager_init()
@@ -255,7 +203,7 @@ def main():
     manager_thread()
   except Exception:
     traceback.print_exc()
-    crash.capture_exception()
+    sentry.capture_exception()
   finally:
     manager_cleanup()
 
@@ -272,6 +220,19 @@ def main():
 
 
 if __name__ == "__main__":
+  if os.path.isfile("/EON"):
+    if not os.path.isfile("/system/fonts/NotoSansCJKtc-Regular.otf"):
+      os.system("mount -o remount,rw /system")
+      os.system("rm -fr /system/fonts/NotoSansTC*.otf")
+      os.system("rm -fr /system/fonts/NotoSansSC*.otf")
+      os.system("rm -fr /system/fonts/NotoSansKR*.otf")
+      os.system("rm -fr /system/fonts/NotoSansJP*.otf")
+      os.system("cp -rf /data/openpilot/selfdrive/assets/fonts/NotoSansCJKtc-* /system/fonts/")
+      os.system("cp -rf /data/openpilot/selfdrive/assets/fonts/fonts.xml /system/etc/fonts.xml")
+      os.system("chmod 644 /system/etc/fonts.xml")
+      os.system("chmod 644 /system/fonts/NotoSansCJKtc-*")
+      os.system("mount -o remount,r /system")
+
   unblock_stdout()
 
   try:
@@ -279,6 +240,11 @@ if __name__ == "__main__":
   except Exception:
     add_file_handler(cloudlog)
     cloudlog.exception("Manager failed to start")
+
+    try:
+      managed_processes['ui'].stop()
+    except Exception:
+      pass
 
     # Show last 3 lines of traceback
     error = traceback.format_exc(-3)

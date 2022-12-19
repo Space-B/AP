@@ -8,10 +8,10 @@
 #include "cereal/messaging/messaging.h"
 #include "common/transformations/coordinates.hpp"
 #include "common/transformations/orientation.hpp"
-#include "selfdrive/common/params.h"
-#include "selfdrive/common/swaglog.h"
-#include "selfdrive/common/timing.h"
-#include "selfdrive/common/util.h"
+#include "common/params.h"
+#include "common/swaglog.h"
+#include "common/timing.h"
+#include "common/util.h"
 
 #include "selfdrive/sensord/sensors/constants.h"
 #define VISION_DECIMATION 2
@@ -35,8 +35,8 @@ public:
   bool isGpsOK();
   void determine_gps_mode(double current_time);
 
-  kj::ArrayPtr<capnp::byte> get_message_bytes(MessageBuilder& msg_builder, uint64_t logMonoTime,
-    bool inputsOK, bool sensorsOK, bool gpsOK);
+  kj::ArrayPtr<capnp::byte> get_message_bytes(MessageBuilder& msg_builder,
+    bool inputsOK, bool sensorsOK, bool gpsOK, bool msgValid);
   void build_live_location(cereal::LiveLocationKalman::Builder& fix);
 
   Eigen::VectorXd get_position_geodetic();
@@ -46,7 +46,8 @@ public:
   void handle_msg_bytes(const char *data, const size_t size);
   void handle_msg(const cereal::Event::Reader& log);
   void handle_sensors(double current_time, const capnp::List<cereal::SensorEventData, capnp::Kind::STRUCT>::Reader& log);
-  void handle_gps(double current_time, const cereal::GpsLocationData::Reader& log);
+//  void handle_sensor(double current_time, const cereal::SensorEventData::Reader& log);
+  void handle_gps(double current_time, const cereal::GpsLocationData::Reader& log, const double sensor_time_offset);
   void handle_car_state(double current_time, const cereal::CarState::Reader& log);
   void handle_cam_odo(double current_time, const cereal::CameraOdometry::Reader& log);
   void handle_live_calib(double current_time, const cereal::LiveCalibrationData::Reader& log);

@@ -2,31 +2,39 @@
 from cereal import car
 from common.params import Params
 from common.realtime import Priority, config_realtime_process
-from selfdrive.swaglog import cloudlog
-from selfdrive.controls.lib.longitudinal_planner import Planner
+from system.swaglog import cloudlog
+from selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from selfdrive.controls.lib.lateral_planner import LateralPlanner
-from selfdrive.hardware import TICI, JETSON
 import cereal.messaging as messaging
+from system.hardware import TICI
 
+from selfdrive.dragonpilot.controls_0813.lib.lateral_planner import LateralPlanner as DPLateralPlanner
+from selfdrive.dragonpilot.controls_0816.lib.lateral_planner import LateralPlanner as FPLateralPlanner
 
 def plannerd_thread(sm=None, pm=None):
-  config_realtime_process(5 if TICI else 4 if JETSON else 2, Priority.CTRL_LOW)
+  config_realtime_process(5 if TICI else 2, Priority.CTRL_LOW)
 
   cloudlog.info("plannerd is waiting for CarParams")
   params = Params()
   CP = car.CarParams.from_bytes(params.get("CarParams", block=True))
   cloudlog.info("plannerd got CarParams: %s", CP.carName)
 
-  use_lanelines = not params.get_bool('EndToEndToggle')
-  wide_camera = params.get_bool('EnableWideCamera') if TICI else False
-
-  cloudlog.event("e2e mode", on=use_lanelines)
-
-  longitudinal_planner = Planner(CP)
-  lateral_planner = LateralPlanner(CP, use_lanelines=use_lanelines, wide_camera=wide_camera)
+  longitudinal_planner = LongitudinalPlanner(CP)
+  try:
+    lat_version = int(params.get('dp_lateral_version').decode('utf8'))
+  except:
+    # if we have trouble reading it, reset it to latest lateral planner
+    params.put('dp_lateral_version', "0")
+    lat_version = 0
+  if lat_version == 1: # 0813
+    lateral_planner = DPLateralPlanner(CP)
+  elif lat_version == 2: # 0816
+    lateral_planner = FPLateralPlanner(CP)
+  else:
+    lateral_planner = LateralPlanner(CP)
 
   if sm is None:
-    sm = messaging.SubMaster(['carState', 'controlsState', 'radarState', 'modelV2', 'dragonConf', 'lateralPlan', 'liveMapData'],
+    sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'radarState', 'modelV2', 'dragonConf', 'lateralPlan', 'navInstruction', 'liveMapData'],
                              poll=['radarState', 'modelV2'], ignore_avg_freq=['radarState'])
 
   if pm is None:

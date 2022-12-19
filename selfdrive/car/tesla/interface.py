@@ -4,12 +4,11 @@ from panda import Panda
 from selfdrive.car.tesla.values import CANBUS, CAR
 from selfdrive.car import STD_CARGO_KG, gen_empty_fingerprint, scale_rot_inertia, scale_tire_stiffness, get_safety_config
 from selfdrive.car.interfaces import CarInterfaceBase
-from common.dp_common import common_interface_atl
 
 
 class CarInterface(CarInterfaceBase):
   @staticmethod
-  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=None):
+  def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=None, experimental_long=False):
     ret = CarInterfaceBase.get_std_params(candidate, fingerprint)
     ret.carName = "tesla"
 
@@ -26,7 +25,6 @@ class CarInterface(CarInterfaceBase):
     ret.longitudinalTuning.kiBP = [0]
     ret.longitudinalTuning.kiV = [0]
     ret.stopAccel = 0.0
-    ret.startAccel = 0.0
     ret.longitudinalActuatorDelayUpperBound = 0.5 # s
     ret.radarTimeStep = (1.0 / 8) # 8Hz
 
@@ -42,14 +40,14 @@ class CarInterface(CarInterfaceBase):
       ret.openpilotLongitudinalControl = False
       ret.safetyConfigs = [get_safety_config(car.CarParams.SafetyModel.tesla, 0)]
 
-    ret.steerActuatorDelay = 0.1
-    ret.steerRateCost = 0.5
+    ret.steerLimitTimer = 1.0
+    ret.steerActuatorDelay = 0.25
 
-    if candidate in [CAR.AP2_MODELS, CAR.AP1_MODELS]:
+    if candidate in (CAR.AP2_MODELS, CAR.AP1_MODELS):
       ret.mass = 2100. + STD_CARGO_KG
       ret.wheelbase = 2.959
       ret.centerToFront = ret.wheelbase * 0.5
-      ret.steerRatio = 13.5
+      ret.steerRatio = 15.0
     else:
       raise ValueError(f"Unsupported car: {candidate}")
 
@@ -58,24 +56,12 @@ class CarInterface(CarInterfaceBase):
 
     return ret
 
-  def update(self, c, can_strings, dragonconf):
-    self.cp.update_strings(can_strings)
-    self.cp_cam.update_strings(can_strings)
-
+  def _update(self, c):
     ret = self.CS.update(self.cp, self.cp_cam)
-    # dp
-    self.dragonconf = dragonconf
-    if ret.vEgo >= self.CP.minSteerSpeed:
-      ret.cruiseState.enabled = common_interface_atl(ret, dragonconf.dpAtl)
-    ret.canValid = self.cp.can_valid and self.cp_cam.can_valid
 
-    events = self.create_common_events(ret)
+    ret.events = self.create_common_events(ret).to_msg()
 
-    ret.events = events.to_msg()
-    self.CS.out = ret.as_reader()
-    return self.CS.out
+    return ret
 
   def apply(self, c):
-    can_sends = self.CC.update(c.enabled, self.CS, self.frame, c.actuators, c.cruiseControl.cancel)
-    self.frame += 1
-    return can_sends
+    return self.CC.update(c, self.CS)

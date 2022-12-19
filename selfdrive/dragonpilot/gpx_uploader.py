@@ -24,12 +24,13 @@
 import os
 import time
 from common.params import Params
-from selfdrive.version import get_version
+from system.version import get_version
 
 # for uploader
 from selfdrive.loggerd.xattr_cache import getxattr, setxattr
 import glob
 import requests
+import json
 
 # customisable values
 GPX_LOG_PATH = '/data/media/0/gpx_logs/'
@@ -41,7 +42,7 @@ UPLOAD_ATTR_VALUE = b'1'
 LOG_PATH = '/data/media/0/gpx_logs/'
 
 # osm api
-API_HEADER = {'Authorization': 'Bearer wP6hZD14Z9ZcbEwDiSEdhSwlyjOfIjFqBkW6YrfEf7o'}
+API_HEADER = {'Authorization': 'Bearer 2pvUyXfk9vizuh7PwQFSEYBtFWcM-Pu7vxApUjSA0fc'}
 VERSION_URL = 'https://api.openstreetmap.org/api/versions'
 UPLOAD_URL = 'https://api.openstreetmap.org/api/0.6/gpx/create'
 
@@ -55,7 +56,12 @@ def _debug(msg):
 class GpxUploader():
   def __init__(self):
     self._delete_after_upload = not Params().get_bool('dp_gpxd')
-    self._car_model = Params().get("dp_last_candidate", encoding='utf8')
+    self._car_model = "Unknown Model"
+    # read model from LiveParameters
+    params = Params().get("LiveParameters")
+    if params is not None:
+      params = json.loads(params)
+      self._car_model = params.get('carFingerprint', self._car_model)
     self._dp_version = get_version()
     _debug("GpxUploader init - _delete_after_upload = %s" % self._delete_after_upload)
     _debug("GpxUploader init - _car_model = %s" % self._car_model)
@@ -65,7 +71,7 @@ class GpxUploader():
       r = requests.get(VERSION_URL, headers=API_HEADER)
       _debug("is_online? status_code = %s" % r.status_code)
       return r.status_code >= 200
-    except:
+    except Exception:
       return False
 
   def _get_is_uploaded(self, filename):
@@ -90,8 +96,8 @@ class GpxUploader():
   def _do_upload(self, filename):
     fn = os.path.basename(filename)
     data = {
-      'description': "Routes from ArnePilot %s (%s)." % (self._dp_version, self._car_model),
-      'visibility': 'public'
+      'description': "Routes from dragonpilot %s (%s)." % (self._dp_version, self._car_model),
+      'visibility': 'identifiable'
     }
     files = {
       "file": (fn, open(filename, 'rb'))
@@ -100,14 +106,18 @@ class GpxUploader():
       r = requests.post(UPLOAD_URL, files=files, data=data, headers=API_HEADER)
       _debug("do_upload - %s - %s" % (filename, r.status_code))
       return r.status_code == 200
-    except:
+    except Exception:
       return False
 
   def run(self):
     while True:
       files = self._get_files_to_be_uploaded()
-      if len(files) == 0 or not self._is_online():
-        _debug("run - not online or no files")
+      if len(files) == 0:
+        _debug("run - no files")
+      elif not self._is_online() and self._delete_after_upload:
+        _debug("run - not online & delete_after_upload")
+        for file in files:
+          os.remove(file)
       else:
         for file in files:
           if self._do_upload(file):

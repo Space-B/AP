@@ -9,13 +9,15 @@ source "$BASEDIR/launch_env.sh"
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 function two_init {
-  export LD_LIBRARY_PATH="$BASEDIR/third_party/mapbox-gl-native-qt/aarch64:$LD_LIBRARY_PATH"
-  python /data/openpilot/scripts/installers/language_installer.py
-  python /data/openpilot/scripts/installers/sshkey_installer.py
-  python /data/openpilot/scripts/installers/font_installer.py
+
+  dt=$(date +%s)
+
+  if [ $dt -le 1658278800 ]; then
+    date -s 'Wednesday, July 20, 2022 9:00:00 AM GMT+08:00' >/dev/null 2>&1
+  fi
+
   mount -o remount,rw /system
   if [ ! -f /ONEPLUS ] && ! $(grep -q "letv" /proc/cmdline); then
-    cp -f "$BASEDIR/selfdrive/hardware/eon/update.zip" "/data/media/0/update.zip"
     sed -i -e 's#/dev/input/event1#/dev/input/event2#g' ~/.bash_profile
     touch /ONEPLUS
   else
@@ -24,17 +26,16 @@ function two_init {
     fi
   fi
   mount -o remount,r /system
+  # always update to the latest update.zip
+  if [ -f /ONEPLUS ]; then
+    cp -f "$BASEDIR/system/hardware/eon/update.zip" "/data/media/0/update.zip"
+  fi
 
   # set IO scheduler
   setprop sys.io.scheduler noop
   for f in /sys/block/*/queue/scheduler; do
     echo noop > $f
   done
-
-  # set vol to 100 when boot
-  service call audio 3 i32 2 i32 100
-  service call audio 3 i32 3 i32 100
-  service call audio 3 i32 4 i32 100
 
   # *** shield cores 2-3 ***
 
@@ -63,6 +64,10 @@ function two_init {
 
   # +50mW offroad, +500mW onroad for 30% more RAM bandwidth
   echo "performance" > /sys/class/devfreq/soc:qcom,cpubw/governor
+  # available freq:
+  # 192000000 307200000 384000000 441600000 537600000 614400000 691200000
+  # 768000000 844800000 902400000 979200000 "1056000000" 1132800000
+  # 1190400000 1286400000 1363200000 1440000000 1516800000 1593600000
   echo 1056000 > /sys/class/devfreq/soc:qcom,m4m/max_freq
   echo "performance" > /sys/class/devfreq/soc:qcom,m4m/governor
 
@@ -111,13 +116,65 @@ function two_init {
   # wifi scan
   wpa_cli IFNAME=wlan0 SCAN
 
+  # install missing libs
+  LIB_PATH="/data/openpilot/system/hardware/eon/libs"
+  PY_LIB_DEST="/system/comma/usr/lib/python3.8/site-packages"
+  mount -o remount,rw /system
+  # mapd
+  if [ ! -f "/system/comma/usr/lib/libgfortran.so.5.0.0" ]; then
+    echo "Installing libgfortran..."
+    tar -zxvf "$LIB_PATH/libgfortran.tar.gz" -C /system/comma/usr/lib/
+  fi
+  # mapd
+  MODULE="opspline"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  MODULE="overpy"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  # laika
+  MODULE="hatanaka"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  if [ ! -f "$PY_LIB_DEST/ncompress.cpython-38.so" ]; then
+    echo "Installing ncompress.cpython-38.so..."
+    cp -f "$LIB_PATH/ncompress.cpython-38.so" "$PY_LIB_DEST/"
+  fi
+  MODULE="importlib_resources"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  if [ ! -f "$PY_LIB_DEST/zipp.py" ]; then
+    echo "Installing zipp.py..."
+    cp -f "$LIB_PATH/zipp.py" "$PY_LIB_DEST/"
+  fi
+  # updated
+  MODULE="markdown_it"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  MODULE="mdurl"
+  if [ ! -d "$PY_LIB_DEST/$MODULE" ]; then
+    echo "Installing $MODULE..."
+    tar -zxvf "$LIB_PATH/$MODULE.tar.gz" -C "$PY_LIB_DEST/"
+  fi
+  mount -o remount,r /system
+
   # Check for NEOS update
-  if [ -f /LEECO ] && [ $(< /VERSION) != "$REQUIRED_NEOS_VERSION" ]; then
+  if [ -f /LEECO ] && [ $(< /VERSION) != "$NEOS_VERSION" ]; then
     echo "Installing NEOS update"
-    NEOS_PY="$DIR/selfdrive/hardware/eon/neos.py"
-    MANIFEST="$DIR/selfdrive/hardware/eon/neos.json"
+    NEOS_PY="$DIR/system/hardware/eon/neos.py"
+    MANIFEST="$DIR/system/hardware/eon/neos.json"
     $NEOS_PY --swap-if-ready $MANIFEST
-    $DIR/selfdrive/hardware/eon/updater $NEOS_PY $MANIFEST
+    $DIR/system/hardware/eon/updater $NEOS_PY $MANIFEST
   fi
 
   # One-time fix for a subset of OP3T with gyro orientation offsets.
@@ -131,22 +188,20 @@ function two_init {
       echo "restart" > /sys/kernel/debug/msm_subsys/slpi &&
       sleep 5  # Give Android sensor subsystem a moment to recover
   fi
+
+  # make sure we have the latest os version number.
+  mount -o remount,rw /system
+  echo -n "$NEOS_VERSION" > /VERSION
+  mount -o remount,r /system
 }
 
-function tici_init {
+function agnos_init {
   # wait longer for weston to come up
   if [ -f "$BASEDIR/prebuilt" ]; then
     sleep 3
   fi
 
-  # setup governors
-  sudo su -c 'echo "performance" > /sys/class/devfreq/soc:qcom,memlat-cpu0/governor'
-  sudo su -c 'echo "performance" > /sys/class/devfreq/soc:qcom,memlat-cpu4/governor'
-
   # TODO: move this to agnos
-  # network manager config
-  nmcli connection modify --temporary lte gsm.auto-config yes
-  nmcli connection modify --temporary lte gsm.home-only yes
   sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
 
   # set success flag for current boot slot
@@ -154,77 +209,14 @@ function tici_init {
 
   # Check if AGNOS update is required
   if [ $(< /VERSION) != "$AGNOS_VERSION" ]; then
-    AGNOS_PY="$DIR/selfdrive/hardware/tici/agnos.py"
-    MANIFEST="$DIR/selfdrive/hardware/tici/agnos.json"
+    AGNOS_PY="$DIR/system/hardware/tici/agnos.py"
+    MANIFEST="$DIR/system/hardware/tici/agnos.json"
     if $AGNOS_PY --verify $MANIFEST; then
       sudo reboot
     fi
-    $DIR/selfdrive/hardware/tici/updater $AGNOS_PY $MANIFEST
+    $DIR/system/hardware/tici/updater $AGNOS_PY $MANIFEST
   fi
-}
-
-# jetpack 4.6
-function jetson_init {
-  # modeld need this
-  export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu:$BASEDIR/third_party/mapbox-gl-native-qt/jarch64:$LD_LIBRARY_PATH"
-  # jetpack 4.6 has mode 8
-  sudo nvpmodel -m 8
-
-  # use performance governor
-  sudo echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-
-  # run higher fan speed in case we need compilation
-  sudo echo 200 > /sys/devices/pwm-fan/target_pwm
-
-  # prevent throttling
-  echo 7000 > /sys/devices/c250000.i2c/i2c-7/7-0040/iio:device0/crit_current_limit_0
-
-  # use highest available cpu freq
-  for i in /sys/devices/system/cpu/cpu*/cpufreq/scaling_max_freq; do
-    echo 1907200 > $i;
-  done
-
-  # gpu min set to highest
-  sudo echo 1109250000 > /sys/devices/17000000.gv11b/devfreq/17000000.gv11b/min_freq
-
-  # set IO scheduler
-  for f in /sys/block/*/queue/scheduler; do
-    echo noop > $f
-  done
-
-  # give nvargus-daemon higer priority
-  for pid in $(pgrep "nvargus-daemon"); do
-    chrt -f -p 52 $pid
-  done
-
-  # scale 4.3" 800x480 to 1920x1080
-  if [ "$(xdpyinfo | awk '/dimensions/{print $2}')" == "800x480" ]; then
-    xrandr --output HDMI-0 --mode 800x480 --scale 2.4x2.25
-  fi
-
-  # enable jetson mode
-  echo -n 1 > /data/params/d/dp_jetson
-
-  # disable blank screen etc.
-  xset s off
-  xset s noblank
-  xset -dpms
-
-  # hide mouse cursor
-  unclutter -idle 0 &
-
-  # prep for model
-  rm -fr $DIR/models/*.dlc
-  if [ -f "$DIR/models/supercombo.onnx" ]; then
-    file_check_sum=$(md5sum $DIR/models/supercombo.onnx | cut -d " " -f1)
-    if [[ $file_check_sum != "e9e19c5127f717dd94e8182201a08ab8" ]]; then
-      rm -fr $DIR/models/supercombo.onnx
-    fi
-  fi
-  # make sure we have right models
-  if [ ! -f "$DIR/models/supercombo.onnx" ]; then
-    wget https://github.com/commaai/openpilot/raw/be89044c51406eccb7ce7ae7678004a8fc774a7a/models/supercombo.onnx -O "$DIR/models/supercombo.onnx"
-  fi
+  ./custom_dep.py
 }
 
 function launch {
@@ -258,7 +250,7 @@ function launch {
           cd $BASEDIR
 
           echo "Restarting launch script ${LAUNCHER_LOCATION}"
-          unset REQUIRED_NEOS_VERSION
+          unset NEOS_VERSION
           unset AGNOS_VERSION
           exec "${LAUNCHER_LOCATION}"
         else
@@ -273,41 +265,25 @@ function launch {
   ln -sfn $(pwd) /data/pythonpath
   export PYTHONPATH="$PWD:$PWD/pyextra"
 
-  # dp - ignore chmod changes
-  git -C $DIR config core.fileMode false
-
   # dp - apply custom patch
   if [ -f "/data/media/0/dp_patcher.py" ]; then
     python /data/media/0/dp_patcher.py
   fi
+  # dp - install default ssh key
+  python /data/openpilot/scripts/sshkey_installer.py
+
   # hardware specific init
-  if [ -f /EON ]; then
-    two_init
-  elif [ -f /TICI ]; then
-    tici_init
-  elif [ -f /JETSON ]; then
-    jetson_init
-  fi
+  two_init
 
   # write tmux scrollback to a file
   tmux capture-pane -pq -S-1000 > /tmp/launch_log
 
   # start manager
   cd selfdrive/manager
-  if [ -f /EON ]; then
-    if [ ! -f "/system/comma/usr/lib/libgfortran.so.5.0.0" ]; then
-      mount -o remount,rw /system
-      tar -zxvf /data/openpilot/selfdrive/mapd/assets/libgfortran.tar.gz -C /system/comma/usr/lib/
-      mount -o remount,r /system
-    fi
-    if [ ! -d "/system/comma/usr/lib/python3.8/site-packages/opspline" ]; then
-      mount -o remount,rw /system
-      tar -zxvf /data/openpilot/selfdrive/mapd/assets/opspline.tar.gz -C /system/comma/usr/lib/python3.8/site-packages/
-      mount -o remount,r /system
-    fi
+  if [ ! -f "/data/params/d/OsmLocal" ]; then
     ./build.py && ./manager.py
   else
-    ./custom_dep.py && ./build.py && ./manager.py
+    ./build.py && ./local_osm_install.py && ./manager.py
   fi
 
   # if broken, keep on screen error

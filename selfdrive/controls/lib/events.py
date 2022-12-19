@@ -1,15 +1,19 @@
 # This Python file uses the following encoding: utf-8
 # -*- coding: utf-8 -*-
+from common.i18n import events
+_ = events()
+
+import math
+import os
 from enum import IntEnum
-from typing import Dict, Union, Callable
+from typing import Dict, Union, Callable, List, Optional
 
 from cereal import log, car
 import cereal.messaging as messaging
+from common.conversions import Conversions as CV
 from common.realtime import DT_CTRL
-from selfdrive.config import Conversions as CV
 from selfdrive.locationd.calibrationd import MIN_SPEED_FILTER
-from common.i18n import events
-_ = events()
+from system.version import get_short_branch
 
 AlertSize = log.ControlsState.AlertSize
 AlertStatus = log.ControlsState.AlertStatus
@@ -32,6 +36,8 @@ class Priority(IntEnum):
 class ET:
   ENABLE = 'enable'
   PRE_ENABLE = 'preEnable'
+  OVERRIDE_LATERAL = 'overrideLateral'
+  OVERRIDE_LONGITUDINAL = 'overrideLongitudinal'
   NO_ENTRY = 'noEntry'
   WARNING = 'warning'
   USER_DISABLE = 'userDisable'
@@ -46,33 +52,30 @@ EVENT_NAME = {v: k for k, v in EventName.schema.enumerants.items()}
 
 class Events:
   def __init__(self):
-    self.events = []
-    self.static_events = []
+    self.events: List[int] = []
+    self.static_events: List[int] = []
     self.events_prev = dict.fromkeys(EVENTS.keys(), 0)
 
   @property
-  def names(self):
+  def names(self) -> List[int]:
     return self.events
 
-  def __len__(self):
+  def __len__(self) -> int:
     return len(self.events)
 
-  def add(self, event_name, static=False):
+  def add(self, event_name: int, static: bool=False) -> None:
     if static:
       self.static_events.append(event_name)
     self.events.append(event_name)
 
-  def clear(self):
+  def clear(self) -> None:
     self.events_prev = {k: (v + 1 if k in self.events else 0) for k, v in self.events_prev.items()}
     self.events = self.static_events.copy()
 
-  def any(self, event_type):
-    for e in self.events:
-      if event_type in EVENTS.get(e, {}).keys():
-        return True
-    return False
+  def any(self, event_type: str) -> bool:
+    return any(event_type in EVENTS.get(e, {}) for e in self.events)
 
-  def create_alerts(self, event_types, callback_args=None):
+  def create_alerts(self, event_types: List[str], callback_args=None):
     if callback_args is None:
       callback_args = []
 
@@ -100,7 +103,7 @@ class Events:
     for event_name in self.events:
       event = car.CarEvent.new_message()
       event.name = event_name
-      for event_type in EVENTS.get(event_name, {}).keys():
+      for event_type in EVENTS.get(event_name, {}):
         setattr(event, event_type, True)
       ret.append(event)
     return ret
@@ -133,24 +136,28 @@ class Alert:
     self.creation_delay = creation_delay
 
     self.alert_type = ""
-    self.event_type = None
+    self.event_type: Optional[str] = None
 
   def __str__(self) -> str:
     return f"{self.alert_text_1}/{self.alert_text_2} {self.priority} {self.visual_alert} {self.audible_alert}"
 
   def __gt__(self, alert2) -> bool:
+    if not isinstance(alert2, Alert):
+      return False
     return self.priority > alert2.priority
 
 
 class NoEntryAlert(Alert):
-  def __init__(self, alert_text_2, visual_alert=VisualAlert.none):
-    super().__init__(_("openpilot Unavailable"), alert_text_2, AlertStatus.normal,
+  def __init__(self, alert_text_2: str,
+               alert_text_1: str = _("openpilot Unavailable"),
+               visual_alert: car.CarControl.HUDControl.VisualAlert=VisualAlert.none):
+    super().__init__(alert_text_1, alert_text_2, AlertStatus.normal,
                      AlertSize.mid, Priority.LOW, visual_alert,
                      AudibleAlert.refuse, 3.)
 
 
 class SoftDisableAlert(Alert):
-  def __init__(self, alert_text_2):
+  def __init__(self, alert_text_2: str):
     super().__init__(_("TAKE CONTROL IMMEDIATELY"), alert_text_2,
                      AlertStatus.userPrompt, AlertSize.full,
                      Priority.MID, VisualAlert.steerRequired,
@@ -159,13 +166,13 @@ class SoftDisableAlert(Alert):
 
 # less harsh version of SoftDisable, where the condition is user-triggered
 class UserSoftDisableAlert(SoftDisableAlert):
-  def __init__(self, alert_text_2):
+  def __init__(self, alert_text_2: str):
     super().__init__(alert_text_2),
     self.alert_text_1 = _("openpilot will disengage")
 
 
 class ImmediateDisableAlert(Alert):
-  def __init__(self, alert_text_2):
+  def __init__(self, alert_text_2: str):
     super().__init__(_("TAKE CONTROL IMMEDIATELY"), alert_text_2,
                      AlertStatus.critical, AlertSize.full,
                      Priority.HIGHEST, VisualAlert.steerRequired,
@@ -191,7 +198,7 @@ class StartupAlert(Alert):
   def __init__(self, alert_text_1: str, alert_text_2: str = _("Always keep hands on wheel and eyes on road"), alert_status=AlertStatus.normal):
     super().__init__(alert_text_1, alert_text_2,
                      alert_status, AlertSize.mid,
-                     Priority.LOWER, VisualAlert.none, AudibleAlert.none, 5.),
+                     Priority.LOWER, VisualAlert.none, AudibleAlert.none, 10.),
 
 
 # ********** helper functions **********
@@ -203,30 +210,35 @@ def get_display_speed(speed_ms: float, metric: bool) -> str:
 
 # ********** alert callback functions **********
 
-AlertCallbackType = Callable[[car.CarParams, messaging.SubMaster, bool, int], Alert]
+AlertCallbackType = Callable[[car.CarParams, car.CarState, messaging.SubMaster, bool, int], Alert]
 
 
 def soft_disable_alert(alert_text_2: str) -> AlertCallbackType:
-  def func(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  def func(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
     if soft_disable_time < int(0.5 / DT_CTRL):
       return ImmediateDisableAlert(alert_text_2)
     return SoftDisableAlert(alert_text_2)
   return func
 
-
 def user_soft_disable_alert(alert_text_2: str) -> AlertCallbackType:
-  def func(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  def func(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
     if soft_disable_time < int(0.5 / DT_CTRL):
       return ImmediateDisableAlert(alert_text_2)
     return UserSoftDisableAlert(alert_text_2)
   return func
 
+def startup_master_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  branch = get_short_branch("")  # Ensure get_short_branch is cached to avoid lags on startup
+  if "REPLAY" in os.environ:
+    branch = "replay"
 
-def below_engage_speed_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  return StartupAlert(_("WARNING: This branch is not tested"), branch, alert_status=AlertStatus.userPrompt)
+
+def below_engage_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   return NoEntryAlert(f"Speed Below {get_display_speed(CP.minEnableSpeed, metric)}")
 
 
-def below_steer_speed_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+def below_steer_speed_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   return Alert(
     _("Steer Unavailable Below %s") % get_display_speed(CP.minSteerSpeed, metric),
     "",
@@ -234,7 +246,7 @@ def below_steer_speed_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: 
     Priority.MID, VisualAlert.steerRequired, AudibleAlert.prompt, 0.4)
 
 
-def calibration_incomplete_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+def calibration_incomplete_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   return Alert(
     _("Calibration in Progress: %d%%") % sm['liveCalibration'].calPerc,
     _("Drive Above %s") % get_display_speed(MIN_SPEED_FILTER, metric),
@@ -242,36 +254,88 @@ def calibration_incomplete_alert(CP: car.CarParams, sm: messaging.SubMaster, met
     Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .2)
 
 
-def no_gps_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
-  gps_integrated = sm['peripheralState'].pandaType in [log.PandaState.PandaType.uno, log.PandaState.PandaType.dos]
+def no_gps_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  gps_integrated = sm['peripheralState'].pandaType in (log.PandaState.PandaType.uno, log.PandaState.PandaType.dos)
   return Alert(
     _("Poor GPS reception"),
-    _("If sky is visible, contact support") if gps_integrated else _("Check GPS antenna placement"),
+    _("Hardware malfunctioning if sky is visible") if gps_integrated else _("Check GPS antenna placement"),
     AlertStatus.normal, AlertSize.mid,
     Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2, creation_delay=300.)
 
+# *** debug alerts ***
 
-def wrong_car_mode_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+def out_of_space_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  full_perc = round(100. - sm['deviceState'].freeSpacePercent)
+  return NormalPermanentAlert(_("Out of Storage"), _("%s%% full") % full_perc)
+
+
+def posenet_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  mdl = sm['modelV2'].velocity.x[0] if len(sm['modelV2'].velocity.x) else math.nan
+  err = CS.vEgo - mdl
+  msg = f"Speed Error: {err:.1f} m/s"
+  return NoEntryAlert(msg, alert_text_1=_("Posenet Speed Invalid"))
+
+
+def process_not_running_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  not_running = [p.name for p in sm['managerState'].processes if not p.running and p.shouldBeRunning]
+  msg = ', '.join(not_running)
+  return NoEntryAlert(msg, alert_text_1=_("Process Not Running"))
+
+
+def comm_issue_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  bs = [s for s in sm.data.keys() if not sm.all_checks([s, ])]
+  msg = ', '.join(bs[:4])  # can't fit too many on one line
+  return NoEntryAlert(msg, alert_text_1=_("Communication Issue Between Processes"))
+
+
+def camera_malfunction_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  all_cams = ('roadCameraState')
+  bad_cams = [s.replace('State', '') for s in all_cams if s in sm.data.keys() and not sm.all_checks([s, ])]
+  return NormalPermanentAlert(_("Camera Malfunction"), ', '.join(bad_cams))
+
+
+def calibration_invalid_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  rpy = sm['liveCalibration'].rpyCalib
+  yaw = math.degrees(rpy[2] if len(rpy) == 3 else math.nan)
+  pitch = math.degrees(rpy[1] if len(rpy) == 3 else math.nan)
+  angles = f"Pitch: {pitch:.1f}°, Yaw: {yaw:.1f}°"
+  return NormalPermanentAlert(_("Calibration Invalid"), angles)
+
+
+def overheat_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  cpu = max(sm['deviceState'].cpuTempC, default=0.)
+  gpu = max(sm['deviceState'].gpuTempC, default=0.)
+  temp = max((cpu, gpu, sm['deviceState'].memoryTempC))
+  return NormalPermanentAlert(_("System Overheated"), f"{temp:.0f} °C")
+
+
+def low_memory_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  return NormalPermanentAlert(_("Low Memory"), f"{sm['deviceState'].memoryUsagePercent}% used")
+
+
+def high_cpu_usage_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  x = max(sm['deviceState'].cpuUsagePercent, default=0.)
+  return NormalPermanentAlert(_("High CPU Usage"), _("%s%% used") % x)
+
+
+def modeld_lagging_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+  return NormalPermanentAlert(_("Driving Model Lagging"), f"{sm['modelV2'].frameDropPerc:.1f}% frames dropped")
+
+
+def wrong_car_mode_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   text = _("Cruise Mode Disabled")
   if CP.carName == "honda":
     text = _("Main Switch Off")
   return NoEntryAlert(text)
 
 
-def joystick_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+def joystick_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   axes = sm['testJoystick'].axes
   gb, steer = list(axes)[:2] if len(axes) else (0., 0.)
-  vals = _("Gas: %s%%, Steer: %s%%") % (round(gb * 100.), round(steer * 100.))
+  vals = f"Gas: {round(gb * 100.)}%, Steer: {round(steer * 100.)}%"
   return NormalPermanentAlert(_("Joystick Mode"), vals)
 
-def alca_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
-  return Alert(
-    _("Auto Lane Change starts in %.1f secs") % float(sm['lateralPlan'].dpALCAStartIn),
-    _("Monitor Other Vehicles"),
-    AlertStatus.normal, AlertSize.mid,
-    Priority.LOWER, VisualAlert.steerRequired, AudibleAlert.none, 0., alert_rate=0.1)
-
-def speed_limit_adjust_alert(CP: car.CarParams, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
+def speed_limit_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int) -> Alert:
   speedLimit = sm['longitudinalPlan'].speedLimit
   speed = round(speedLimit * (CV.MS_TO_KPH if metric else CV.MS_TO_MPH))
   message = _("Adjusting to %(speed)s %(unit)s") % ({"speed": speed, "unit": (_("km/h") if metric else _("mph"))})
@@ -303,8 +367,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   },
 
   EventName.startupMaster: {
-    ET.PERMANENT: StartupAlert(_("WARNING: This branch is not tested"),
-                               alert_status=AlertStatus.userPrompt),
+    ET.PERMANENT: startup_master_alert,
   },
 
   # Car is recognized, but marked as dashcam only
@@ -335,14 +398,6 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   EventName.cruiseMismatch: {
     #ET.PERMANENT: ImmediateDisableAlert(_("openpilot failed to cancel cruise")),
-  },
-
-  # Some features or cars are marked as community features. If openpilot
-  # detects the use of a community feature it switches to dashcam mode
-  # until these features are allowed using a toggle in settings.
-  EventName.communityFeatureDisallowed: {
-    ET.PERMANENT: NormalPermanentAlert(_("openpilot Unavailable"),
-                                       _("Enable Community Features in Settings")),
   },
 
   # openpilot doesn't recognize the car. This switches openpilot into a
@@ -381,14 +436,6 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   # ********** events only containing alerts that display while engaged **********
 
-  EventName.gasPressed: {
-    ET.PRE_ENABLE: Alert(
-      _("Release Gas Pedal to Engage"),
-      "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1, creation_delay=1.),
-  },
-
   # openpilot tries to learn certain parameters about your car by observing
   # how the car behaves to steering inputs from both human and openpilot driving.
   # This includes:
@@ -407,7 +454,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
       _("Steering Temporarily Unavailable"),
       "",
       AlertStatus.userPrompt, AlertSize.small,
-      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.),
+      Priority.LOW, VisualAlert.steerRequired, AudibleAlert.prompt, 1.8),
   },
 
   EventName.preDriverDistracted: {
@@ -520,24 +567,32 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   # Thrown when the fan is driven at >50% but is not rotating
   EventName.fanMalfunction: {
-    ET.PERMANENT: NormalPermanentAlert(_("Fan Malfunction"), _("Contact Support")),
+    ET.PERMANENT: NormalPermanentAlert(_("Fan Malfunction"), _("Likely Hardware Issue")),
   },
 
-  # Camera is not outputting frames at a constant framerate
+  # Camera is not outputting frames
   EventName.cameraMalfunction: {
-    ET.PERMANENT: NormalPermanentAlert(_("Camera Malfunction"), _("Contact Support")),
+    ET.PERMANENT: camera_malfunction_alert,
+    ET.SOFT_DISABLE: soft_disable_alert(_("Camera Malfunction")),
+    ET.NO_ENTRY: NoEntryAlert(_("Camera Malfunction: Reboot Your Device")),
+  },
+  # Camera framerate too low
+  EventName.cameraFrameRate: {
+    ET.PERMANENT: NormalPermanentAlert(_("Camera Frame Rate Low"), _("Reboot your Device")),
+    ET.SOFT_DISABLE: soft_disable_alert(_("Camera Frame Rate Low")),
+    ET.NO_ENTRY: NoEntryAlert(_("Camera Frame Rate Low: Reboot Your Device")),
   },
 
   # Unused
   EventName.gpsMalfunction: {
-    ET.PERMANENT: NormalPermanentAlert(_("GPS Malfunction"), _("Contact Support")),
+    ET.PERMANENT: NormalPermanentAlert(_("GPS Malfunction"), _("Likely Hardware Issue")),
   },
 
   # When the GPS position and localizer diverge the localizer is reset to the
   # current GPS position. This alert is thrown when the localizer is reset
   # more often than expected.
   EventName.localizerMalfunction: {
-    ET.PERMANENT: NormalPermanentAlert(_("Sensor Malfunction"), _("Contact Support")),
+    # ET.PERMANENT: NormalPermanentAlert(_("Sensor Malfunction"), _("Hardware Malfunction")),
   },
 
   EventName.speedLimitActive: {
@@ -586,9 +641,37 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
                               visual_alert=VisualAlert.brakePressed),
   },
 
+  EventName.pedalPressedPreEnable: {
+    ET.PRE_ENABLE: Alert(
+      _("Release Pedal to Engage"),
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1, creation_delay=1.),
+  },
+
+  EventName.gasPressedOverride: {
+    ET.OVERRIDE_LONGITUDINAL: Alert(
+      "",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1),
+  },
+
+  EventName.steerOverride: {
+    ET.OVERRIDE_LATERAL: Alert(
+      "",
+      "",
+      AlertStatus.normal, AlertSize.none,
+      Priority.LOWEST, VisualAlert.none, AudibleAlert.none, .1),
+  },
+
   EventName.wrongCarMode: {
     ET.USER_DISABLE: EngagementAlert(AudibleAlert.disengage),
     ET.NO_ENTRY: wrong_car_mode_alert,
+  },
+
+  EventName.resumeBlocked: {
+    ET.NO_ENTRY: NoEntryAlert("Press Set to Engage"),
   },
 
   EventName.wrongCruiseMode: {
@@ -602,7 +685,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   },
 
   EventName.outOfSpace: {
-    ET.PERMANENT: NormalPermanentAlert(_("Out of Storage")),
+    ET.PERMANENT: out_of_space_alert,
     ET.NO_ENTRY: NoEntryAlert(_("Out of Storage")),
   },
 
@@ -612,11 +695,12 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   EventName.sensorDataInvalid: {
     ET.PERMANENT: Alert(
-      _("No Data from Device Sensors"),
-      _("Reboot your Device"),
+      _("Sensor Data Invalid"),
+      _("Ensure device is mounted securely"),
       AlertStatus.normal, AlertSize.mid,
       Priority.LOWER, VisualAlert.none, AudibleAlert.none, .2, creation_delay=1.),
-    ET.NO_ENTRY: NoEntryAlert(_("No Data from Device Sensors")),
+    ET.NO_ENTRY: NoEntryAlert(_("Sensor Data Invalid")),
+    ET.SOFT_DISABLE: soft_disable_alert(_("Sensor Data Invalid")),
   },
 
   EventName.noGps: {
@@ -633,13 +717,13 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   },
 
   EventName.overheat: {
-    ET.PERMANENT: NormalPermanentAlert(_("System Overheated")),
+    ET.PERMANENT: overheat_alert,
     ET.SOFT_DISABLE: soft_disable_alert(_("System Overheated")),
     ET.NO_ENTRY: NoEntryAlert(_("System Overheated")),
   },
 
   EventName.wrongGear: {
-    #ET.SOFT_DISABLE: user_soft_disable_alert(_("Gear not D")),
+    # ET.SOFT_DISABLE: user_soft_disable_alert(_("Gear not D")),
     ET.NO_ENTRY: NoEntryAlert(_("Gear not D")),
   },
 
@@ -649,7 +733,7 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # and attaching while making sure the device is pointed straight forward and is level.
   # See https://comma.ai/setup for more information
   EventName.calibrationInvalid: {
-    ET.PERMANENT: NormalPermanentAlert(_("Calibration Invalid"), _("Remount Device and Recalibrate")),
+    ET.PERMANENT: calibration_invalid_alert,
     ET.SOFT_DISABLE: soft_disable_alert(_("Calibration Invalid: Remount Device & Recalibrate")),
     ET.NO_ENTRY: NoEntryAlert(_("Calibration Invalid: Remount Device & Recalibrate")),
   },
@@ -686,12 +770,22 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # ten times the regular interval, or the average interval is more than 10% too high.
   EventName.commIssue: {
     ET.SOFT_DISABLE: soft_disable_alert(_("Communication Issue between Processes")),
-    ET.NO_ENTRY: NoEntryAlert(_("Communication Issue between Processes")),
+    ET.NO_ENTRY: comm_issue_alert,
+  },
+  EventName.commIssueAvgFreq: {
+    ET.SOFT_DISABLE: soft_disable_alert(_("Low Communication Rate between Processes")),
+    ET.NO_ENTRY: NoEntryAlert(_("Low Communication Rate between Processes")),
+  },
+
+  EventName.controlsdLagging: {
+    ET.SOFT_DISABLE: soft_disable_alert(_("Controls Lagging")),
+    ET.NO_ENTRY: NoEntryAlert(_("Controls Process Lagging: Reboot Your Device")),
   },
 
   # Thrown when manager detects a service exited unexpectedly while driving
   EventName.processNotRunning: {
-    ET.NO_ENTRY: NoEntryAlert(_("System Malfunction: Reboot Your Device")),
+    ET.NO_ENTRY: process_not_running_alert,
+    ET.SOFT_DISABLE: soft_disable_alert(_("Process Not Running")),
   },
 
   EventName.radarFault: {
@@ -703,8 +797,9 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # is not processing frames fast enough they have to be dropped. This alert is
   # thrown when over 20% of frames are dropped.
   EventName.modeldLagging: {
-    ET.SOFT_DISABLE: soft_disable_alert(_("Driving model lagging")),
-    ET.NO_ENTRY: NoEntryAlert(_("Driving model lagging")),
+    ET.SOFT_DISABLE: soft_disable_alert(_("Driving Model Lagging")),
+    ET.NO_ENTRY: NoEntryAlert(_("Driving Model Lagging")),
+    ET.PERMANENT: modeld_lagging_alert,
   },
 
   # Besides predicting the path, lane lines and lead car data the model also
@@ -713,8 +808,8 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # usually means the model has trouble understanding the scene. This is used
   # as a heuristic to warn the driver.
   EventName.posenetInvalid: {
-    ET.SOFT_DISABLE: soft_disable_alert(_("Model Output Uncertain")),
-    ET.NO_ENTRY: NoEntryAlert(_("Model Output Uncertain")),
+    ET.SOFT_DISABLE: soft_disable_alert(_("Posenet Speed Invalid")),
+    ET.NO_ENTRY: posenet_invalid_alert,
   },
 
   # When the localizer detects an acceleration of more than 40 m/s^2 (~4G) we
@@ -726,14 +821,14 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
 
   EventName.lowMemory: {
     ET.SOFT_DISABLE: soft_disable_alert(_("Low Memory: Reboot Your Device")),
-    ET.PERMANENT: NormalPermanentAlert(_("Low Memory"), _("Reboot your Device")),
+    ET.PERMANENT: low_memory_alert,
     ET.NO_ENTRY: NoEntryAlert(_("Low Memory: Reboot Your Device")),
   },
 
   EventName.highCpuUsage: {
     #ET.SOFT_DISABLE: soft_disable_alert(_("System Malfunction: Reboot Your Device")),
     #ET.PERMANENT: NormalPermanentAlert(_("System Malfunction"), _("Reboot your Device")),
-    ET.NO_ENTRY: NoEntryAlert(_("System Malfunction: Reboot Your Device")),
+    ET.NO_ENTRY: high_cpu_usage_alert,
   },
 
   EventName.accFaulted: {
@@ -742,24 +837,29 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("Cruise Faulted")),
   },
 
+  EventName.accFaultedTemp: {
+    ET.NO_ENTRY: NoEntryAlert("Cruise Temporarily Faulted"),
+  },
+
   EventName.controlsMismatch: {
     ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Controls Mismatch")),
+    ET.NO_ENTRY: NoEntryAlert(_("Controls Mismatch")),
   },
 
   EventName.roadCameraError: {
-    ET.PERMANENT: NormalPermanentAlert(_("Camera Error"),
-                                       duration=1.,
-                                       creation_delay=30.),
-  },
-
-  EventName.driverCameraError: {
-    ET.PERMANENT: NormalPermanentAlert(_("Camera Error"),
+    ET.PERMANENT: NormalPermanentAlert(_("Camera CRC Error - Road"),
                                        duration=1.,
                                        creation_delay=30.),
   },
 
   EventName.wideRoadCameraError: {
-    ET.PERMANENT: NormalPermanentAlert(_("Camera Error"),
+    ET.PERMANENT: NormalPermanentAlert(_("Camera CRC Error - Road Fisheye"),
+                                       duration=1.,
+                                       creation_delay=30.),
+  },
+
+  EventName.driverCameraError: {
+    ET.PERMANENT: NormalPermanentAlert(_("Camera CRC Error - Driver"),
                                        duration=1.,
                                        creation_delay=30.),
   },
@@ -777,13 +877,23 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # - CAN data is received, but some message are not received at the right frequency
   # If you're not writing a new car port, this is usually cause by faulty wiring
   EventName.canError: {
-    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("CAN Error: Check Connections")),
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("CAN Error")),
     ET.PERMANENT: Alert(
       _("CAN Error: Check Connections"),
       "",
       AlertStatus.normal, AlertSize.small,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
     ET.NO_ENTRY: NoEntryAlert(_("CAN Error: Check Connections")),
+  },
+
+  EventName.canBusMissing: {
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("CAN Bus Disconnected")),
+    ET.PERMANENT: Alert(
+      _("CAN Bus Disconnected: Likely Faulty Cable"),
+      "",
+      AlertStatus.normal, AlertSize.small,
+      Priority.LOW, VisualAlert.none, AudibleAlert.none, 1., creation_delay=1.),
+    ET.NO_ENTRY: NoEntryAlert(_("CAN Bus Disconnected: Check Connections")),
   },
 
   EventName.steerUnavailable: {
@@ -827,9 +937,9 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
   # are received on the car side this usually means the relay hasn't opened correctly
   # and this alert is thrown.
   EventName.relayMalfunction: {
-    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Harness Malfunction")),
-    ET.PERMANENT: NormalPermanentAlert(_("Harness Malfunction"), _("Check Hardware")),
-    ET.NO_ENTRY: NoEntryAlert(_("Harness Malfunction")),
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert(_("Harness Relay Malfunction")),
+    ET.PERMANENT: NormalPermanentAlert(_("Harness Relay Malfunction"), _("Check Hardware")),
+    ET.NO_ENTRY: NoEntryAlert(_("Harness Relay Malfunction")),
   },
 
   EventName.noTarget: {
@@ -864,24 +974,18 @@ EVENTS: Dict[int, Dict[str, Union[Alert, AlertCallbackType]]] = {
     ET.NO_ENTRY: NoEntryAlert(_("Cruise Fault: Restart the Car")),
   },
 
-  # dp
-  EventName.autoLaneChange: {
-    ET.WARNING: alca_alert,
+  EventName.lkasDisabled: {
+    ET.PERMANENT: NormalPermanentAlert(_("LKAS Disabled: Enable LKAS to engage")),
+    ET.NO_ENTRY: NoEntryAlert(_("LKAS Disabled")),
   },
 
-  EventName.manualSteeringRequired: {
-    ET.WARNING: Alert(
-      _("STEERING REQUIRED: Lane Keeping OFF"),
+  # dp - use for atl alert
+  EventName.communityFeatureDisallowedDEPRECATED: {
+    ET.OVERRIDE_LATERAL: Alert(
       "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, .0, alert_rate=0.25),
-  },
-
-  EventName.manualSteeringRequiredBlinkersOn: {
-    ET.WARNING: Alert(
-      _("STEERING REQUIRED: Blinkers ON"),
       "",
-      AlertStatus.normal, AlertSize.small,
-      Priority.LOW, VisualAlert.none, AudibleAlert.none, .0, alert_rate=0.25),
+      AlertStatus.normal, AlertSize.none,
+      Priority.MID, VisualAlert.none,
+      AudibleAlert.disengage, .2),
   },
 }

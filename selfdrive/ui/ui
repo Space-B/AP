@@ -1,10 +1,5 @@
 #!/bin/sh
 cd "$(dirname "$0")"
-export LD_LIBRARY_PATH="/system/lib64:$LD_LIBRARY_PATH"
-export QT_PLUGIN_PATH="../../third_party/qt-plugins/$(uname -m)"
-
-if [ -f /TICI ]; then
-  exec ./_ui_c3
-else
-  exec ./_ui
-fi
+export LD_LIBRARY_PATH="/system/lib64:/data/openpilot/third_party/mapbox-gl-native-qt/aarch64:$LD_LIBRARY_PATH"
+export QT_DBL_CLICK_DIST=150
+exec ./_ui

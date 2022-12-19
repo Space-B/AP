@@ -2,12 +2,15 @@ import random
 import threading
 import time
 from statistics import mean
+from typing import Optional
 
 from cereal import log
 from common.params import Params, put_nonblocking
 from common.realtime import sec_since_boot
-from selfdrive.hardware import HARDWARE
-from selfdrive.swaglog import cloudlog
+from system.hardware import HARDWARE
+from system.swaglog import cloudlog
+# from selfdrive.statsd import statlog
+import os
 
 CAR_VOLTAGE_LOW_PASS_K = 0.091 # LPF gain for 5s tau (dt/tau / (dt/tau + 1))
 
@@ -31,6 +34,7 @@ class PowerMonitoring:
     self.car_voltage_mV = 12e3                  # Low-passed version of peripheralState voltage
     self.car_voltage_instant_mV = 12e3          # Last value of peripheralState voltage
     self.integration_lock = threading.Lock()
+    self.is_oneplus = os.path.isfile('/ONEPLUS')
 
     car_battery_capacity_uWh = self.params.get("CarBatteryCapacity")
     if car_battery_capacity_uWh is None:
@@ -55,6 +59,7 @@ class PowerMonitoring:
       # Low-pass battery voltage
       self.car_voltage_instant_mV = peripheralState.voltage
       self.car_voltage_mV = ((peripheralState.voltage * CAR_VOLTAGE_LOW_PASS_K) + (self.car_voltage_mV * (1 - CAR_VOLTAGE_LOW_PASS_K)))
+      # statlog.gauge("car_voltage", self.car_voltage_mV / 1e3)
 
       # Cap the car battery power and save it in a param every 10-ish seconds
       self.car_battery_capacity_uWh = max(self.car_battery_capacity_uWh, 0)
@@ -74,8 +79,8 @@ class PowerMonitoring:
         with self.integration_lock:
           self.power_used_uWh = 0
           integration_time_h = (now - self.last_measurement_time) / 3600
-          # if integration_time_h < 0:
-          #   raise ValueError(f"Negative integration time: {integration_time_h}h")
+          if integration_time_h < 0:
+            raise ValueError(f"Negative integration time: {integration_time_h}h")
           self.car_battery_capacity_uWh += (CAR_CHARGING_RATE_W * 1e6 * integration_time_h)
           self.last_measurement_time = now
       else:
@@ -85,10 +90,6 @@ class PowerMonitoring:
         current_power = HARDWARE.get_current_power_draw() # pylint: disable=assignment-from-none
         if current_power is not None:
           pass
-        elif HARDWARE.get_battery_status() == 'Discharging':
-          # If the battery is discharging, we can use this measurement
-          # On C2: this is low by about 10-15%, probably mostly due to UNO draw not being factored in
-          current_power = ((HARDWARE.get_battery_voltage() / 1000000) * (HARDWARE.get_battery_current() / 1000000))
         elif (self.next_pulsed_measurement_time is not None) and (self.next_pulsed_measurement_time <= now):
           # TODO: Figure out why this is off by a factor of 3/4???
           FUDGE_FACTOR = 1.33
@@ -135,14 +136,14 @@ class PowerMonitoring:
     except Exception:
       cloudlog.exception("Power monitoring calculation failed")
 
-  def _perform_integration(self, t, current_power):
+  def _perform_integration(self, t: float, current_power: float) -> None:
     with self.integration_lock:
       try:
         if self.last_measurement_time:
           integration_time_h = (t - self.last_measurement_time) / 3600
           power_used = (current_power * 1000000) * integration_time_h
-          # if power_used < 0:
-          #   raise ValueError(f"Negative power used! Integration time: {integration_time_h} h Current Power: {power_used} uWh")
+          if power_used < 0:
+            raise ValueError(f"Negative power used! Integration time: {integration_time_h} h Current Power: {power_used} uWh")
           self.power_used_uWh += power_used
           self.car_battery_capacity_uWh -= power_used
           self.last_measurement_time = t
@@ -150,21 +151,19 @@ class PowerMonitoring:
         cloudlog.exception("Integration failed")
 
   # Get the power usage
-  def get_power_used(self):
+  def get_power_used(self) -> int:
     return int(self.power_used_uWh)
 
-  def get_car_battery_capacity(self):
+  def get_car_battery_capacity(self) -> int:
     return int(self.car_battery_capacity_uWh)
 
   # See if we need to disable charging
-  def should_disable_charging(self, ignition, in_car, offroad_timestamp, dp_auto_shutdown, dp_auto_shutdown_in):
+  def should_disable_charging(self, ignition: bool, in_car: bool, offroad_timestamp: Optional[float]) -> bool:
     if offroad_timestamp is None:
       return False
 
     now = sec_since_boot()
     disable_charging = False
-    if dp_auto_shutdown:
-      disable_charging |= (now - offroad_timestamp) > dp_auto_shutdown_in * 60
     disable_charging |= (now - offroad_timestamp) > MAX_TIME_OFFROAD_S
     disable_charging |= (self.car_voltage_mV < (VBATT_PAUSE_CHARGING * 1e3)) and (self.car_voltage_instant_mV > (VBATT_INSTANT_PAUSE_CHARGING * 1e3))
     disable_charging |= (self.car_battery_capacity_uWh <= 0)
@@ -175,17 +174,17 @@ class PowerMonitoring:
     return disable_charging
 
   # See if we need to shutdown
-  def should_shutdown(self, peripheralState, ignition, in_car, offroad_timestamp, started_seen, dp_auto_shutdown, dp_auto_shutdown_in):
+  def should_shutdown(self, peripheralState, ignition, in_car, offroad_timestamp, started_seen):
     if offroad_timestamp is None:
       return False
 
     now = sec_since_boot()
     panda_charging = (peripheralState.usbPowerMode != log.PeripheralState.UsbPowerMode.client)
-    BATT_PERC_OFF = 10
+    # BATT_PERC_OFF = 3 if self.is_oneplus else 10
 
     should_shutdown = False
     # Wait until we have shut down charging before powering down
-    should_shutdown |= (not panda_charging and self.should_disable_charging(ignition, in_car, offroad_timestamp, dp_auto_shutdown, dp_auto_shutdown_in))
-    should_shutdown |= ((HARDWARE.get_battery_capacity() < BATT_PERC_OFF) and (not HARDWARE.get_battery_charging()) and ((now - offroad_timestamp) > 60))
+    should_shutdown |= (not panda_charging and self.should_disable_charging(ignition, in_car, offroad_timestamp))
+    # should_shutdown |= ((HARDWARE.get_battery_capacity() < BATT_PERC_OFF) and (not HARDWARE.get_battery_charging()) and ((now - offroad_timestamp) > 60))
     should_shutdown &= started_seen or (now > MIN_ON_TIME_S)
     return should_shutdown

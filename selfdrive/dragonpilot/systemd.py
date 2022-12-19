@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#pylint: disable=W0105
 # The MIT License
 #
 # Copyright (c) 2019-, Rick Lan, dragonpilot community, and a number of other of contributors.
@@ -27,24 +28,23 @@ This is a service that broadcast dp config values to openpilot's messaging queue
 import cereal.messaging as messaging
 
 from common.dp_conf import confs, get_struct_name, to_struct_val
-from common.params import Params, put_nonblocking
+from common.params import Params
 import os
-from selfdrive.hardware import HARDWARE
 params = Params()
-from common.dp_common import param_get, get_last_modified
-from common.dp_time import LAST_MODIFIED_SYSTEMD
+from common.dp_helpers import get_last_modified, LAST_MODIFIED_TIMER_SYSTEMD
 from selfdrive.dragonpilot.dashcamd import Dashcamd
-from selfdrive.hardware import EON
 import socket
 from common.realtime import Ratekeeper
 import threading
 from selfdrive.dragonpilot.gpx_uploader import gpx_uploader_thread
+from typing import Dict, Any
+import capnp
 
-PARAM_PATH = params.get_params_path() + '/d/'
+PARAM_PATH = params.get_param_path() + "/"
 
 HERTZ = 1
 
-last_modified_confs = {}
+last_modified_confs: Dict[str, Any] = {}
 
 def confd_thread():
   sm = messaging.SubMaster(['deviceState'])
@@ -57,10 +57,9 @@ def confd_thread():
   last_modified = None
   last_modified_check = None
   started = False
-  free_space = 1
+  free_space = 1.
   last_started = False
   dashcamd = Dashcamd()
-  is_eon = EON
   rk = Ratekeeper(HERTZ, print_delay_threshold=None)  # Keeps rate at 2 hz
   uploader_thread = None
 
@@ -89,7 +88,7 @@ def confd_thread():
     we do it after 30 secs just in case
     ===================================================
     '''
-    if is_eon and frame == (HERTZ * 30) and param_get("dp_hotspot_on_boot", "bool", False):
+    if frame == (HERTZ * 30) and params.get_bool("dp_hotspot_on_boot"):
       os.system("service call wifi 37 i32 0 i32 1 &")
     '''
     ===================================================
@@ -97,20 +96,17 @@ def confd_thread():
     ===================================================
     '''
     if not update_params:
-      last_modified_check, modified = get_last_modified(LAST_MODIFIED_SYSTEMD, last_modified_check, modified)
+      last_modified_check, modified = get_last_modified(LAST_MODIFIED_TIMER_SYSTEMD, last_modified_check, modified)
       if last_modified != modified:
         update_params = True
         last_modified = modified
     '''
     ===================================================
-    conditionally set update_params to true 
+    conditionally set update_params to true
     ===================================================
     '''
-    # force updating param when `started` changed
-    if last_started != started:
-      update_params = True
-
-    if frame == 0:
+    # force updating param when just started or `started` changed
+    if frame == 0 or last_started != started:
       update_params = True
     '''
     ===================================================
@@ -125,10 +121,11 @@ def confd_thread():
     push once
     ===================================================
     '''
-    if frame == 0:
-      setattr(msg.dragonConf, get_struct_name('dp_locale'), params.get("dp_locale"))
-      # mirror EndToEndToggle to dp_lane_less_model_ctrl first time, after all
-      put_nonblocking('dp_lane_less_mode_ctrl', "1" if params.get_bool('EndToEndToggle') else "0")
+    # if frame == 0:
+    #   setattr(msg.dragonConf, get_struct_name('dp_locale'), params.get("dp_locale"))
+    #
+    #   # mirror EndToEndToggle to dp_lane_less_model_ctrl first time, after all
+    #   put_nonblocking('dp_lane_less_mode_ctrl', "1" if params.get_bool('EndToEndToggle') else "0")
     '''
     ===================================================
     push ip addr every 10 secs
@@ -197,35 +194,29 @@ def update_conf_all(confs, msg, first_run = False):
     msg = update_conf(msg, conf, first_run)
   return msg
 
-def process_charging_ctrl(msg, last_charging_ctrl, battery_percent):
-  charging_ctrl = msg.dragonConf.dpChargingCtrl
-  if last_charging_ctrl != charging_ctrl:
-    HARDWARE.set_battery_charging(True)
-  if charging_ctrl:
-    if battery_percent >= msg.dragonConf.dpDischargingAt and HARDWARE.get_battery_charging():
-      HARDWARE.set_battery_charging(False)
-    elif battery_percent <= msg.dragonConf.dpChargingAt and not HARDWARE.get_battery_charging():
-      HARDWARE.set_battery_charging(True)
-  return charging_ctrl
+# def process_charging_ctrl(msg, last_charging_ctrl, battery_percent):
+#   charging_ctrl = msg.dragonConf.dpChargingCtrl
+#   if last_charging_ctrl != charging_ctrl:
+#     HARDWARE.set_battery_charging(True)
+#   if charging_ctrl:
+#     if battery_percent >= msg.dragonConf.dpDischargingAt and HARDWARE.get_battery_charging():
+#       HARDWARE.set_battery_charging(False)
+#     elif battery_percent <= msg.dragonConf.dpChargingAt and not HARDWARE.get_battery_charging():
+#       HARDWARE.set_battery_charging(True)
+#   return charging_ctrl
 
 def update_custom_logic(msg):
-  if msg.dragonConf.dpAtl:
-    msg.dragonConf.dpAllowGas = True
-    msg.dragonConf.dpGearCheck = False
-    if not msg.dragonConf.dpAtlOpLong:
-      # msg.dragonConf.dpFollowingProfileCtrl = False
-      msg.dragonConf.dpAccelProfileCtrl = False
-  if msg.dragonConf.dpLcMinMph > msg.dragonConf.dpLcAutoMinMph:
-    put_nonblocking('dp_lc_auto_min_mph', str(msg.dragonConf.dpLcMinMph))
-    msg.dragonConf.dpLcAutoMinMph = msg.dragonConf.dpLcMinMph
-  # if msg.dragonConf.dpSrCustom <= 4.99 and msg.dragonConf.dpSrStock > 0:
-  #   put_nonblocking('dp_sr_custom', str(msg.dragonConf.dpSrStock))
-  #   msg.dragonConf.dpSrCustom = msg.dragonConf.dpSrStock
-  # if msg.dragonConf.dpAppWaze or msg.dragonConf.dpAppHr:
-  #   msg.dragonConf.dpDrivingUi = False
-  # if not msg.dragonConf.dpDriverMonitor:
-  #   msg.dragonConf.dpUiFace = False
   return msg
+#   if msg.dragonConf.dpAtl:
+#     msg.dragonConf.dpAllowGas = True
+#     msg.dragonConf.dpGearCheck = False
+#     if not msg.dragonConf.dpAtlOpLong:
+#       # msg.dragonConf.dpFollowingProfileCtrl = False
+#       msg.dragonConf.dpAccelProfileCtrl = False
+#   if msg.dragonConf.dpLcMinMph > msg.dragonConf.dpLcAutoMinMph:
+#     put_nonblocking('dp_lc_auto_min_mph', str(msg.dragonConf.dpLcMinMph))
+#     msg.dragonConf.dpLcAutoMinMph = msg.dragonConf.dpLcMinMph
+#   return msg
 
 
 def update_ip(msg):
@@ -259,7 +250,11 @@ def set_message(msg, conf):
       struct_val = min(struct_val, conf.get('max'))
   if orig_val != struct_val:
     params.put(conf['name'], str(struct_val))
-  setattr(msg.dragonConf, get_struct_name(conf['name']), struct_val)
+  try:
+    setattr(msg.dragonConf, get_struct_name(conf['name']), struct_val)
+  except capnp.lib.capnp.KjException:
+    pass
+
   return msg
 
 def check_dependencies(msg, conf):

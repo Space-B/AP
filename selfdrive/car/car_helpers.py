@@ -1,23 +1,28 @@
 import os
-import threading
-import requests
-from common.params import Params, put_nonblocking
-from common.basedir import BASEDIR
-# from selfdrive.version import get_comma_remote, get_tested_branch
-from selfdrive.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
-from selfdrive.car.vin import get_vin, VIN_UNKNOWN
-from selfdrive.car.fw_versions import get_fw_versions, match_fw_to_car
-from selfdrive.swaglog import cloudlog
-import cereal.messaging as messaging
-from selfdrive.car import gen_empty_fingerprint
-import selfdrive.crash as crash
+from typing import Dict, List
 
 from cereal import car
+from common.params import Params
+from common.basedir import BASEDIR
+# from system.version import is_comma_remote, is_tested_branch
+from selfdrive.car.interfaces import get_interface_attr
+from selfdrive.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
+from selfdrive.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
+from selfdrive.car.fw_versions import get_fw_versions_ordered, match_fw_to_car, get_present_ecus
+from system.swaglog import cloudlog
+import cereal.messaging as messaging
+from selfdrive.car import gen_empty_fingerprint
+
+import threading
+import requests
+import time
+import selfdrive.sentry as sentry
+
 EventName = car.CarEvent.EventName
 
 
 def get_startup_event(car_recognized, controller_available, fw_seen):
-  if True: #get_comma_remote() and get_tested_branch():
+  if True: #is_comma_remote() and is_tested_branch():  # pylint: disable=abstract-class-instantiated
     event = EventName.startup
   else:
     event = EventName.startupMaster
@@ -42,7 +47,7 @@ def get_one_can(logcan):
 def load_interfaces(brand_names):
   ret = {}
   for brand_name in brand_names:
-    path = ('selfdrive.car.%s' % brand_name)
+    path = f'selfdrive.car.{brand_name}'
     CarInterface = __import__(path + '.interface', fromlist=['CarInterface']).CarInterface
 
     if os.path.exists(BASEDIR + '/' + path.replace('.', '/') + '/carstate.py'):
@@ -60,19 +65,12 @@ def load_interfaces(brand_names):
   return ret
 
 
-def _get_interface_names():
-  # read all the folders in selfdrive/car and return a dict where:
-  # - keys are all the car names that which we have an interface for
-  # - values are lists of spefic car models for a given car
+def _get_interface_names() -> Dict[str, List[str]]:
+  # returns a dict of brand name and its respective models
   brand_names = {}
-  for car_folder in [x[0] for x in os.walk(BASEDIR + '/selfdrive/car')]:
-    try:
-      brand_name = car_folder.split('/')[-1]
-      model_names = __import__('selfdrive.car.%s.values' % brand_name, fromlist=['CAR']).CAR
-      model_names = [getattr(model_names, c) for c in model_names.__dict__.keys() if not c.startswith("__")]
-      brand_names[brand_name] = model_names
-    except (ImportError, IOError):
-      pass
+  for brand_name, model_names in get_interface_attr("CAR").items():
+    model_names = [getattr(model_names, c) for c in model_names.__dict__.keys() if not c.startswith("__")]
+    brand_names[brand_name] = model_names
 
   return brand_names
 
@@ -83,18 +81,18 @@ interfaces = load_interfaces(interface_names)
 
 
 # **** for use live only ****
-def fingerprint(logcan, sendcan):
+def fingerprint(logcan, sendcan, num_pandas):
   fixed_fingerprint = os.environ.get('FINGERPRINT', "")
   skip_fw_query = os.environ.get('SKIP_FW_QUERY', False)
+  ecu_rx_addrs = set()
 
   dp_car_assigned = Params().get('dp_car_assigned', encoding='utf8')
-  if dp_car_assigned is not None:
+  if not fixed_fingerprint and dp_car_assigned is not None:
     car_selected = dp_car_assigned.strip()
     fixed_fingerprint = car_selected
-    skip_fw_query = True
 
   if not fixed_fingerprint and not skip_fw_query:
-    # Vin query only reliably works thorugh OBDII
+    # Vin query only reliably works through OBDII
     bus = 1
 
     cached_params = Params().get("CarParamsCache")
@@ -105,27 +103,37 @@ def fingerprint(logcan, sendcan):
 
     if cached_params is not None and len(cached_params.carFw) > 0 and cached_params.carVin is not VIN_UNKNOWN:
       cloudlog.warning("Using cached CarParams")
-      vin = cached_params.carVin
+      vin, vin_rx_addr = cached_params.carVin, 0
       car_fw = list(cached_params.carFw)
+      cached = True
     else:
       cloudlog.warning("Getting VIN & FW versions")
-      _, vin = get_vin(logcan, sendcan, bus)
-      car_fw = get_fw_versions(logcan, sendcan, bus)
+      vin_rx_addr, vin = get_vin(logcan, sendcan, bus)
+      ecu_rx_addrs = get_present_ecus(logcan, sendcan)
+      car_fw = get_fw_versions_ordered(logcan, sendcan, ecu_rx_addrs, num_pandas=num_pandas)
+      cached = False
 
     exact_fw_match, fw_candidates = match_fw_to_car(car_fw)
   else:
-    vin = VIN_UNKNOWN
+    vin, vin_rx_addr = VIN_UNKNOWN, 0
     exact_fw_match, fw_candidates, car_fw = True, set(), []
+    cached = False
 
+  if not is_valid_vin(vin):
+    cloudlog.event("Malformed VIN", vin=vin, error=True)
+    vin = VIN_UNKNOWN
   cloudlog.warning("VIN %s", vin)
   Params().put("CarVin", vin)
 
   finger = gen_empty_fingerprint()
   candidate_cars = {i: all_legacy_fingerprint_cars() for i in [0, 1]}  # attempt fingerprint on both bus 0 and 1
   frame = 0
-  frame_fingerprint = 10  # 0.1s
+  frame_fingerprint = 100  # 1s
   car_fingerprint = None
   done = False
+
+  # drain CAN socket so we always get the latest messages
+  messaging.drain_sock_raw(logcan)
 
   while not done:
     a = get_one_can(logcan)
@@ -134,13 +142,13 @@ def fingerprint(logcan, sendcan):
       # The fingerprint dict is generated for all buses, this way the car interface
       # can use it to detect a (valid) multipanda setup and initialize accordingly
       if can.src < 128:
-        if can.src not in finger.keys():
+        if can.src not in finger:
           finger[can.src] = {}
         finger[can.src][can.address] = len(can.dat)
 
       for b in candidate_cars:
         # Ignore extended messages and VIN query response.
-        if can.src == b and can.address < 0x800 and can.address not in [0x7df, 0x7e0, 0x7e8]:
+        if can.src == b and can.address < 0x800 and can.address not in (0x7df, 0x7e0, 0x7e8):
           candidate_cars[b] = eliminate_incompatible_cars(can, candidate_cars[b])
 
     # if we only have one car choice and the time since we got our first
@@ -170,66 +178,69 @@ def fingerprint(logcan, sendcan):
     car_fingerprint = fixed_fingerprint
     source = car.CarParams.FingerprintSource.fixed
 
-  cloudlog.event("fingerprinted", car_fingerprint=car_fingerprint,
-                 source=source, fuzzy=not exact_match, fw_count=len(car_fw))
+  cloudlog.event("fingerprinted", car_fingerprint=car_fingerprint, source=source, fuzzy=not exact_match, cached=cached,
+                 fw_count=len(car_fw), ecu_responses=list(ecu_rx_addrs), vin_rx_addr=vin_rx_addr, error=True)
   return car_fingerprint, finger, vin, car_fw, source, exact_match
 
+#dp
 def is_connected_to_internet(timeout=5):
-    try:
-        requests.get("https://sentry.io", timeout=timeout)
-        return True
-    except Exception:
-        return False
+  try:
+    requests.get("https://sentry.io", timeout=timeout)
+    return True
+  except Exception:
+    return False
+
 
 def crash_log(candidate):
+  no_internet = 0
   while True:
     if is_connected_to_internet():
-      crash.capture_warning("fingerprinted %s" % candidate)
+      sentry.capture_warning("fingerprinted %s" % candidate)
       break
+    else:
+      no_internet += 1
+      if no_internet >= 2:
+        break
+      time.sleep(600)
+
 
 def crash_log2(fingerprints, fw):
+  no_internet = 0
   while True:
     if is_connected_to_internet():
-      crash.capture_warning("car doesn't match any fingerprints: %s" % fingerprints)
-      crash.capture_warning("car doesn't match any fw: %s" % fw)
+      sentry.capture_warning("car doesn't match any fingerprints: %s" % fingerprints)
+      sentry.capture_warning("car doesn't match any fw: %s" % fw)
       break
+    else:
+      no_internet += 1
+      if no_internet >= 2:
+        break
+      time.sleep(600)
 
-def get_car(logcan, sendcan):
-  candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(logcan, sendcan)
+
+def get_car(logcan, sendcan, num_pandas=1):
+  candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(logcan, sendcan, num_pandas)
 
   if candidate is None:
     cloudlog.warning("car doesn't match any fingerprints: %r", fingerprints)
     candidate = "mock"
+
     y = threading.Thread(target=crash_log2, args=(fingerprints,car_fw,))
     y.start()
 
   x = threading.Thread(target=crash_log, args=(candidate,))
   x.start()
 
+  experimental_long = Params().get_bool("ExperimentalLongitudinalEnabled")
+
   try:
     CarInterface, CarController, CarState = interfaces[candidate]
-    car_params = CarInterface.get_params(candidate, fingerprints, car_fw)
-    car_params.carVin = vin
-    car_params.carFw = car_fw
-    car_params.fingerprintSource = source
-    car_params.fuzzyFingerprint = not exact_match
+    CP = CarInterface.get_params(candidate, fingerprints, car_fw, experimental_long)
+    CP.carVin = vin
+    CP.carFw = car_fw
+    CP.fingerprintSource = source
+    CP.fuzzyFingerprint = not exact_match
 
-    # dp - handle sr learner memory/reset feature
-    params = Params()
-    candidate_changed = params.get('dp_last_candidate', encoding='utf8') != candidate
-    # keep stock sr
-    put_nonblocking("dp_sr_stock", str(car_params.steerRatio))
-    dp_sr_custom = params.get("dp_sr_custom", encoding='utf8')
-    # reset default sr
-    if dp_sr_custom == '' or candidate_changed or (dp_sr_custom != '' and float(dp_sr_custom) <= 9.99):
-      put_nonblocking("dp_sr_custom", str(car_params.steerRatio))
-    # update last candidate
-    put_nonblocking('dp_last_candidate', candidate)
-
-    return CarInterface(car_params, CarController, CarState), car_params
+    return CarInterface(CP, CarController, CarState), CP
   except KeyError:
-    put_nonblocking("dp_last_candidate", '')
-    put_nonblocking("dp_car_assigned", '')
-    put_nonblocking("dp_sr_custom", '9.99')
-    put_nonblocking("dp_sr_stock", '9.99')
     return None, None
